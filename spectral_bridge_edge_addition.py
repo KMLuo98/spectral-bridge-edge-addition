@@ -1,15 +1,29 @@
 """Spectral bridge edge addition for complex-network resilience.
 
-Single-file implementation of SBIA and centrality baselines.  The input network
-is supplied from the command line.  For adjacency matrices the script detects
-whether the network is directed and/or weighted automatically.
+This single-file script evaluates the spectral bridge iterative addition (SBIA)
+rule and four centrality-based baselines on an input network.  The network is
+passed as a command-line argument.  For adjacency-matrix inputs, the script
+automatically detects whether the network is directed and/or weighted.
+
+Examples
+--------
+Run on an adjacency matrix:
+
+    python spectral_bridge_edge_addition.py --input network.txt --output-dir results/network
+
+Run a synthetic example corresponding to Figs. 4--6:
+
+    python spectral_bridge_edge_addition.py --example fig4 --network BA --output-dir results/fig4_BA
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import networkx as nx
@@ -17,310 +31,560 @@ import numpy as np
 import pandas as pd
 import scipy.linalg as la
 
+
 ALGORITHMS = ["SBIA", "Deg", "Bet", "Clos", "PR"]
-COLORS = {"SBIA": "#084081", "Deg": "#2c7fb8", "Bet": "#4292c6", "Clos": "#6baed6", "PR": "#9ecae1"}
+COLORS = {
+    "SBIA": "#084081",
+    "Deg": "#2c7fb8",
+    "Bet": "#4292c6",
+    "Clos": "#6baed6",
+    "PR": "#9ecae1",
+}
 MARKERS = {"SBIA": "o", "Deg": "^", "Bet": "s", "Clos": "D", "PR": "v"}
 
 
-def read_rows(path: Path):
-    rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        rows.append([x.strip() for x in line.split(",")] if "," in line else line.split())
-    return rows
+@dataclass
+class NetworkInput:
+    adjacency: np.ndarray
+    labels: List[str]
+    directed: bool
+    weighted: bool
+    source_format: str
 
 
-def try_matrix(rows):
+def _split_fields(line: str) -> List[str]:
+    if "," in line:
+        return [part.strip() for part in line.split(",") if part.strip()]
+    return line.split()
+
+
+def _as_float_matrix(rows: Sequence[Sequence[str]]) -> Optional[np.ndarray]:
     try:
-        a = np.asarray([[float(x) for x in r] for r in rows], dtype=float)
+        matrix = np.asarray([[float(x) for x in row] for row in rows], dtype=float)
     except ValueError:
         return None
-    return a if a.ndim == 2 and a.shape[0] == a.shape[1] and a.shape[0] > 0 else None
+    if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[0] != matrix.shape[1]:
+        return None
+    return matrix
 
 
-def load_network(path: Path, fmt="auto"):
-    rows = read_rows(path)
-    a = try_matrix(rows)
-    labels = None
-    source_format = "matrix"
-    if fmt == "matrix" or (fmt == "auto" and a is not None):
-        if a is None:
-            raise ValueError("matrix input must be square numeric data")
-        np.fill_diagonal(a, 0.0)
-        labels = [str(i) for i in range(a.shape[0])]
-    else:
-        source_format = "edgelist"
-        labels, index, edges = [], {}, []
-        def idx(x):
-            if x not in index:
-                index[x] = len(labels)
-                labels.append(x)
-            return index[x]
-        for r in rows:
-            if len(r) < 2:
-                raise ValueError(f"bad edge-list row: {r}")
-            u, v = idx(r[0]), idx(r[1])
-            w = float(r[2]) if len(r) > 2 else 1.0
-            edges.append((u, v, w))
-        a = np.zeros((len(labels), len(labels)), dtype=float)
-        for u, v, w in edges:
-            if u != v:
-                a[u, v] = w
-    directed = not np.allclose(a, a.T, atol=1e-10)
-    if source_format == "edgelist" and not directed:
-        a = np.maximum(a, a.T)
-    weights = a[np.abs(a) > 1e-12]
-    weighted = bool(weights.size and not np.allclose(weights, np.ones_like(weights), atol=1e-10))
-    return a, labels, directed, weighted, source_format
+def _nonzero_weights(adjacency: np.ndarray) -> np.ndarray:
+    return adjacency[np.abs(adjacency) > 1e-12]
 
 
-def laplacian(a):
-    return np.diag(a.sum(axis=1)) - a
+def detect_weighted(adjacency: np.ndarray) -> bool:
+    weights = _nonzero_weights(adjacency)
+    if weights.size == 0:
+        return False
+    return not np.allclose(weights, np.ones_like(weights), atol=1e-10)
 
 
-def candidates(a, directed):
-    n = a.shape[0]
+def detect_directed(adjacency: np.ndarray) -> bool:
+    return not np.allclose(adjacency, adjacency.T, atol=1e-10)
+
+
+def load_network(path: Path, input_format: str = "auto") -> NetworkInput:
+    """Load a network from an adjacency matrix or an edge list.
+
+    Adjacency matrices are interpreted in the usual convention
+    ``A[i, j] = weight of edge i -> j``.  Matrix inputs allow exact automatic
+    detection of directedness and weights.  Edge-list inputs are intrinsically
+    ambiguous when undirected edges are listed once; for unambiguous automatic
+    detection, prefer adjacency matrices or include reciprocal directed edges.
+    """
+    text_lines = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not text_lines:
+        raise ValueError(f"empty network file: {path}")
+    rows = [_split_fields(line) for line in text_lines]
+
+    matrix = _as_float_matrix(rows)
+    if input_format == "matrix" or (input_format == "auto" and matrix is not None):
+        if matrix is None:
+            raise ValueError("input was requested as matrix but is not square numeric data")
+        np.fill_diagonal(matrix, 0.0)
+        labels = [str(i) for i in range(matrix.shape[0])]
+        return NetworkInput(
+            adjacency=matrix,
+            labels=labels,
+            directed=detect_directed(matrix),
+            weighted=detect_weighted(matrix),
+            source_format="matrix",
+        )
+
+    if input_format not in {"auto", "edgelist"}:
+        raise ValueError(f"unknown input format: {input_format}")
+    return load_edgelist(rows)
+
+
+def load_edgelist(rows: Sequence[Sequence[str]]) -> NetworkInput:
+    labels: List[str] = []
+    label_to_idx: Dict[str, int] = {}
+    edge_rows: List[Tuple[str, str, float]] = []
+
+    def node_index(label: str) -> int:
+        if label not in label_to_idx:
+            label_to_idx[label] = len(labels)
+            labels.append(label)
+        return label_to_idx[label]
+
+    for row in rows:
+        if len(row) < 2:
+            raise ValueError(f"edge-list row has fewer than two fields: {row}")
+        weight = float(row[2]) if len(row) >= 3 else 1.0
+        edge_rows.append((row[0], row[1], weight))
+        node_index(row[0])
+        node_index(row[1])
+
+    adjacency = np.zeros((len(labels), len(labels)), dtype=float)
+    seen: Dict[Tuple[int, int], float] = {}
+    for src_label, dst_label, weight in edge_rows:
+        src = label_to_idx[src_label]
+        dst = label_to_idx[dst_label]
+        if src == dst:
+            continue
+        adjacency[src, dst] = weight
+        seen[(src, dst)] = weight
+
+    directed = False
+    for (src, dst), weight in seen.items():
+        reverse = seen.get((dst, src))
+        if reverse is None or not math.isclose(weight, reverse, rel_tol=1e-10, abs_tol=1e-10):
+            directed = True
+            break
+    if not directed:
+        adjacency = np.maximum(adjacency, adjacency.T)
+
+    return NetworkInput(
+        adjacency=adjacency,
+        labels=labels,
+        directed=directed,
+        weighted=detect_weighted(adjacency),
+        source_format="edgelist",
+    )
+
+
+def laplacian(adjacency: np.ndarray) -> np.ndarray:
+    """Return the out-degree Laplacian for A[i, j] = edge i -> j."""
+    return np.diag(adjacency.sum(axis=1)) - adjacency
+
+
+def candidate_edges(adjacency: np.ndarray, directed: bool) -> List[Tuple[int, int]]:
+    n = adjacency.shape[0]
     if directed:
-        return [(i, j) for i in range(n) for j in range(n) if i != j and a[i, j] == 0]
-    return [(i, j) for i in range(n) for j in range(i + 1, n) if a[i, j] == 0]
+        return [(i, j) for i in range(n) for j in range(n) if i != j and adjacency[i, j] == 0]
+    return [(i, j) for i in range(n) for j in range(i + 1, n) if adjacency[i, j] == 0]
 
 
-def add_edge(a, edge, directed, weight):
-    i, j = edge
-    a[i, j] = weight
+def add_edge(adjacency: np.ndarray, edge: Tuple[int, int], directed: bool, weight: float) -> None:
+    src, dst = edge
+    adjacency[src, dst] = weight
     if not directed:
-        a[j, i] = weight
+        adjacency[dst, src] = weight
 
 
-def mu_f(a, directed):
-    lmat = laplacian(a)
+def generalized_fiedler_value(adjacency: np.ndarray, directed: bool) -> float:
+    lmat = laplacian(adjacency)
     if not directed:
-        vals = np.sort(np.real(la.eigvalsh(lmat)))
+        vals = la.eigvalsh(lmat)
+        vals = np.sort(np.real(vals))
         return float(vals[1])
     vals = la.eigvals(lmat)
-    vals = [z for z in vals if abs(z) > 1e-8 and z.real > 1e-8]
-    return 0.0 if not vals else float(min(vals, key=lambda z: (z.real, abs(z.imag))).real)
+    candidates = [z for z in vals if abs(z) > 1e-8 and z.real > 1e-8]
+    if not candidates:
+        return 0.0
+    return float(min(candidates, key=lambda z: (z.real, abs(z.imag))).real)
 
 
-def sbia_scores(a, directed):
-    lmat = laplacian(a)
+def sbia_scores(adjacency: np.ndarray, directed: bool) -> Dict[Tuple[int, int], float]:
+    lmat = laplacian(adjacency)
     if not directed:
         vals, vecs = la.eigh(lmat)
-        v = np.real(vecs[:, np.argsort(vals)[1]])
-        return {(i, j): float((v[i] - v[j]) ** 2) for i, j in candidates(a, False)}
+        order = np.argsort(vals)
+        fiedler_vec = np.real(vecs[:, order[1]])
+        return {
+            (src, dst): float((fiedler_vec[src] - fiedler_vec[dst]) ** 2)
+            for src, dst in candidate_edges(adjacency, directed=False)
+        }
+
     vals, left, right = la.eig(lmat, left=True, right=True)
-    valid = [k for k, z in enumerate(vals) if abs(z) > 1e-8 and z.real > 1e-8]
+    valid = [idx for idx, val in enumerate(vals) if abs(val) > 1e-8 and val.real > 1e-8]
     if not valid:
-        return {e: 0.0 for e in candidates(a, True)}
-    k = min(valid, key=lambda q: (vals[q].real, abs(vals[q].imag)))
-    u, v = left[:, k], right[:, k]
+        return {edge: 0.0 for edge in candidate_edges(adjacency, directed=True)}
+    idx = min(valid, key=lambda k: (vals[k].real, abs(vals[k].imag)))
+    u = left[:, idx]
+    v = right[:, idx]
     denom = np.vdot(u, v)
     if abs(denom) < 1e-12:
         denom = 1.0
-    return {(i, j): float(np.real(np.conj(u[i]) * (v[i] - v[j]) / denom)) for i, j in candidates(a, True)}
+    scores: Dict[Tuple[int, int], float] = {}
+    for src, dst in candidate_edges(adjacency, directed=True):
+        scores[(src, dst)] = float(np.real(np.conj(u[src]) * (v[src] - v[dst]) / denom))
+    return scores
 
 
-def nx_graph(a, directed):
-    g = nx.DiGraph() if directed else nx.Graph()
-    g.add_nodes_from(range(a.shape[0]))
-    rows, cols = np.where(a > 0)
-    for i, j in zip(rows, cols):
-        if i == j:
+def graph_for_centrality(adjacency: np.ndarray, directed: bool) -> nx.Graph:
+    graph = nx.DiGraph() if directed else nx.Graph()
+    graph.add_nodes_from(range(adjacency.shape[0]))
+    rows, cols = np.where(adjacency > 0)
+    for src, dst in zip(rows, cols):
+        if src == dst:
             continue
         if directed:
-            g.add_edge(int(i), int(j), weight=float(a[i, j]))
-        elif i < j:
-            g.add_edge(int(i), int(j), weight=float(a[i, j]))
-    return g
+            graph.add_edge(int(src), int(dst), weight=float(adjacency[src, dst]))
+        elif src < dst:
+            graph.add_edge(int(src), int(dst), weight=float(adjacency[src, dst]))
+    return graph
 
 
-def node_scores(a, directed, metric):
-    g = nx_graph(a, directed)
+def node_scores(adjacency: np.ndarray, directed: bool, metric: str) -> Dict[int, float]:
+    graph = graph_for_centrality(adjacency, directed)
     if metric == "Deg":
         if directed:
-            scale = max(1, 2 * (len(g) - 1))
-            return {n: float(g.in_degree(n) + g.out_degree(n)) / scale for n in g.nodes()}
-        return nx.degree_centrality(g)
+            scale = max(1, 2 * (len(graph) - 1))
+            return {
+                node: float(graph.in_degree(node) + graph.out_degree(node)) / scale
+                for node in graph.nodes()
+            }
+        return nx.degree_centrality(graph)
     if metric == "Bet":
-        return nx.betweenness_centrality(g, normalized=True, weight=None)
+        return nx.betweenness_centrality(graph, normalized=True, weight=None)
     if metric == "Clos":
-        return nx.closeness_centrality(g)
+        return nx.closeness_centrality(graph)
     if metric == "PR":
-        return nx.pagerank(g, alpha=0.85, weight=None, max_iter=2000, tol=1e-12)
-    raise ValueError(metric)
+        return nx.pagerank(graph, alpha=0.85, weight=None, max_iter=2000, tol=1e-12)
+    raise ValueError(f"unknown metric: {metric}")
 
 
-def pick(scores):
-    return max(scores, key=lambda e: (scores[e], -e[0], -e[1]))
+def select_edge(scores: Dict[Tuple[int, int], float]) -> Tuple[int, int]:
+    return max(scores, key=lambda edge: (scores[edge], -edge[0], -edge[1]))
 
 
-def run_strategy(a0, directed, algorithm, add_weight=1.0, budget=None, variant=None):
-    a = a0.copy()
-    mu0 = mu_f(a, directed)
+def run_strategy(
+    initial_adjacency: np.ndarray,
+    *,
+    directed: bool,
+    add_weight: float,
+    budget: Optional[int],
+    algorithm: str,
+    endpoint_mode: Optional[str] = None,
+) -> Tuple[pd.DataFrame, float, List[Tuple[int, int]]]:
+    adjacency = initial_adjacency.copy()
+    mu0 = generalized_fiedler_value(adjacency, directed)
     if mu0 <= 1e-12:
         raise RuntimeError("initial network has zero generalized Fiedler value")
-    total = len(candidates(a, directed))
-    steps = total if budget is None else min(int(budget), total)
+
+    total_candidates = len(candidate_edges(adjacency, directed))
+    steps = total_candidates if budget is None else min(budget, total_candidates)
     rows = [{"step": 0, "x": 0.0, "mu_f": mu0, "ri": 1.0}]
-    edges = []
+    selected: List[Tuple[int, int]] = []
+
     for step in range(1, steps + 1):
-        cands = candidates(a, directed)
+        cands = candidate_edges(adjacency, directed)
         if not cands:
             break
         if algorithm == "SBIA":
-            scores = sbia_scores(a, directed)
+            scores = sbia_scores(adjacency, directed)
         else:
-            ns = node_scores(a, directed, algorithm)
-            if variant == "sum":
-                scores = {(i, j): ns[i] + ns[j] for i, j in cands}
-            elif variant == "diff":
-                scores = {(i, j): abs(ns[i] - ns[j]) for i, j in cands}
+            scores_by_node = node_scores(adjacency, directed, algorithm)
+            if endpoint_mode == "sum":
+                scores = {(src, dst): scores_by_node[src] + scores_by_node[dst] for src, dst in cands}
+            elif endpoint_mode == "diff":
+                scores = {(src, dst): abs(scores_by_node[src] - scores_by_node[dst]) for src, dst in cands}
             else:
-                raise ValueError("baseline variant must be sum or diff")
-        edge = pick(scores)
-        add_edge(a, edge, directed, add_weight)
-        edges.append(edge)
-        mu = mu_f(a, directed)
-        denom = total if budget is None else steps
-        rows.append({"step": step, "x": step / denom, "mu_f": mu, "ri": mu / mu0})
+                raise ValueError("endpoint_mode must be 'sum' or 'diff' for baseline algorithms")
+        edge = select_edge(scores)
+        add_edge(adjacency, edge, directed, add_weight)
+        selected.append(edge)
+        mu = generalized_fiedler_value(adjacency, directed)
+        denominator = total_candidates if budget is None else steps
+        rows.append({"step": step, "x": step / denominator, "mu_f": mu, "ri": mu / mu0})
+
     frame = pd.DataFrame(rows)
     auc = float(np.trapz(frame["ri"].to_numpy(), frame["x"].to_numpy()))
-    return frame, auc, edges
+    return frame, auc, selected
 
 
-def evaluate(a, labels, directed, budget, add_weight):
-    curves, aucs, edge_rows = [], [], []
-    curve, auc, edges = run_strategy(a, directed, "SBIA", add_weight, budget)
-    curve["algorithm"], curve["variant"] = "SBIA", "spectral"
-    curves.append(curve)
-    aucs.append({"algorithm": "SBIA", "variant": "spectral", "auc": auc})
-    for s, (i, j) in enumerate(edges, 1):
-        edge_rows.append({"algorithm": "SBIA", "variant": "spectral", "step": s, "source": labels[i], "target": labels[j]})
-    for alg in ["Deg", "Bet", "Clos", "PR"]:
+def evaluate_network(
+    network: NetworkInput,
+    *,
+    budget: Optional[int],
+    add_weight: float,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    curve_frames: List[pd.DataFrame] = []
+    auc_rows: List[dict] = []
+    edge_rows: List[dict] = []
+
+    sbia_curve, sbia_auc, sbia_edges = run_strategy(
+        network.adjacency,
+        directed=network.directed,
+        add_weight=add_weight,
+        budget=budget,
+        algorithm="SBIA",
+    )
+    sbia_curve["algorithm"] = "SBIA"
+    sbia_curve["variant"] = "spectral"
+    curve_frames.append(sbia_curve)
+    auc_rows.append({"algorithm": "SBIA", "variant": "spectral", "auc": sbia_auc})
+    for step, (src, dst) in enumerate(sbia_edges, start=1):
+        edge_rows.append(
+            {
+                "algorithm": "SBIA",
+                "variant": "spectral",
+                "step": step,
+                "source": network.labels[src],
+                "target": network.labels[dst],
+            }
+        )
+
+    for algorithm in ["Deg", "Bet", "Clos", "PR"]:
         best = None
-        for var in ["sum", "diff"]:
-            curve, auc, edges = run_strategy(a, directed, alg, add_weight, budget, var)
-            if best is None or auc > best[0]:
-                best = (auc, var, curve, edges)
-        auc, var, curve, edges = best
-        curve["algorithm"], curve["variant"] = alg, var
-        curves.append(curve)
-        aucs.append({"algorithm": alg, "variant": var, "auc": auc})
-        for s, (i, j) in enumerate(edges, 1):
-            edge_rows.append({"algorithm": alg, "variant": var, "step": s, "source": labels[i], "target": labels[j]})
-    return pd.concat(curves, ignore_index=True), pd.DataFrame(aucs), pd.DataFrame(edge_rows)
+        for variant in ["sum", "diff"]:
+            curve, auc, edges = run_strategy(
+                network.adjacency,
+                directed=network.directed,
+                add_weight=add_weight,
+                budget=budget,
+                algorithm=algorithm,
+                endpoint_mode=variant,
+            )
+            candidate = (auc, variant, curve, edges)
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+        assert best is not None
+        auc, variant, curve, edges = best
+        curve["algorithm"] = algorithm
+        curve["variant"] = variant
+        curve_frames.append(curve)
+        auc_rows.append({"algorithm": algorithm, "variant": variant, "auc": auc})
+        for step, (src, dst) in enumerate(edges, start=1):
+            edge_rows.append(
+                {
+                    "algorithm": algorithm,
+                    "variant": variant,
+                    "step": step,
+                    "source": network.labels[src],
+                    "target": network.labels[dst],
+                }
+            )
+
+    curves = pd.concat(curve_frames, ignore_index=True)
+    aucs = pd.DataFrame(auc_rows)
+    selected_edges = pd.DataFrame(edge_rows)
+    return curves, aucs, selected_edges
 
 
-def plot_summary(curves, aucs, out):
+def plot_curves(curves: pd.DataFrame, aucs: pd.DataFrame, output_path: Path) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), constrained_layout=True)
-    for alg in ALGORITHMS:
-        sub = curves[curves.algorithm == alg]
-        axes[0].plot(sub.x, sub.ri, label=alg, color=COLORS[alg], marker=MARKERS[alg], markevery=max(1, len(sub)//10), linewidth=2.2 if alg == "SBIA" else 1.7, markersize=4)
-    axes[0].set_xlabel(r"$f_{\mathrm{EA}}$")
-    axes[0].set_ylabel("RI")
-    axes[0].grid(alpha=0.25)
-    axes[0].legend(frameon=False)
-    ordered = aucs.set_index("algorithm").loc[ALGORITHMS].reset_index()
-    bars = axes[1].barh(np.arange(len(ordered)), ordered.auc, color=[COLORS[a] for a in ordered.algorithm])
-    axes[1].set_yticks(np.arange(len(ordered)), ordered.algorithm)
-    axes[1].invert_yaxis()
-    axes[1].set_xlabel("AUC")
-    axes[1].grid(axis="x", alpha=0.25)
-    for bar, val in zip(bars, ordered.auc):
-        axes[1].text(val, bar.get_y() + bar.get_height() / 2, f" {val:.3g}", va="center")
-    fig.savefig(out, dpi=220, bbox_inches="tight")
+    ax_curve, ax_bar = axes
+    for algorithm in ALGORITHMS:
+        sub = curves[curves["algorithm"] == algorithm]
+        ax_curve.plot(
+            sub["x"],
+            sub["ri"],
+            label=algorithm,
+            color=COLORS[algorithm],
+            marker=MARKERS[algorithm],
+            markevery=max(1, len(sub) // 10),
+            linewidth=2.2 if algorithm == "SBIA" else 1.7,
+            markersize=4,
+        )
+    ax_curve.set_xlabel(r"$f_{\mathrm{EA}}$")
+    ax_curve.set_ylabel("RI")
+    ax_curve.grid(alpha=0.25)
+    ax_curve.legend(frameon=False)
+
+    aucs = aucs.set_index("algorithm").loc[ALGORITHMS].reset_index()
+    bars = ax_bar.barh(
+        np.arange(len(aucs)),
+        aucs["auc"],
+        color=[COLORS[algorithm] for algorithm in aucs["algorithm"]],
+    )
+    ax_bar.set_yticks(np.arange(len(aucs)), aucs["algorithm"])
+    ax_bar.invert_yaxis()
+    ax_bar.set_xlabel("AUC")
+    ax_bar.grid(axis="x", alpha=0.25)
+    for bar, value in zip(bars, aucs["auc"]):
+        ax_bar.text(value, bar.get_y() + bar.get_height() / 2, f" {value:.3g}", va="center")
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
 
 
-def connected_graph(kind, n, seed):
-    for off in range(10000):
-        s = seed + off
+def write_outputs(
+    output_dir: Path,
+    network: NetworkInput,
+    curves: pd.DataFrame,
+    aucs: pd.DataFrame,
+    selected_edges: pd.DataFrame,
+    args: argparse.Namespace,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    curves.to_csv(output_dir / "curves.csv", index=False)
+    aucs.to_csv(output_dir / "auc.csv", index=False)
+    selected_edges.to_csv(output_dir / "selected_edges.csv", index=False)
+    plot_curves(curves, aucs, output_dir / "summary.png")
+    metadata = {
+        "input": str(args.input) if args.input else None,
+        "example": getattr(args, "example", None),
+        "network": getattr(args, "network", None),
+        "seed": getattr(args, "seed", None),
+        "source_format": network.source_format,
+        "nodes": len(network.labels),
+        "directed": network.directed,
+        "weighted": network.weighted,
+        "budget": args.budget,
+        "add_weight": args.add_weight,
+        "algorithms": ALGORITHMS,
+    }
+    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def connected_graph(
+    kind: str,
+    n: int,
+    seed: int,
+    *,
+    ba_m: int,
+    sw_k: int,
+    sw_p: float,
+    er_p: float,
+) -> nx.Graph:
+    for offset in range(10_000):
+        s = seed + offset
         if kind == "BA":
-            g = nx.barabasi_albert_graph(n, 2, seed=s)
+            graph = nx.barabasi_albert_graph(n, ba_m, seed=s)
         elif kind == "SW":
-            g = nx.watts_strogatz_graph(n, 4, 0.15, seed=s)
+            graph = nx.watts_strogatz_graph(n, sw_k, sw_p, seed=s)
         elif kind == "ER":
-            g = nx.erdos_renyi_graph(n, 0.10, seed=s)
+            graph = nx.erdos_renyi_graph(n, er_p, seed=s)
         else:
             raise ValueError(kind)
-        if nx.is_connected(g):
-            return g
-    raise RuntimeError(kind)
+        if nx.is_connected(graph):
+            return graph
+    raise RuntimeError(f"could not generate connected {kind} graph")
 
 
-def undirected_adjacency(g, weighted, seed):
+def orient_strongly_connected(graph: nx.Graph, seed: int) -> np.ndarray:
     rng = np.random.default_rng(seed)
-    a = np.zeros((g.number_of_nodes(), g.number_of_nodes()))
-    for i, j in g.edges():
-        w = float(rng.uniform(0.5, 1.5)) if weighted else 1.0
-        a[i, j] = a[j, i] = w
-    return a
-
-
-def directed_adjacency(g, seed):
-    rng = np.random.default_rng(seed)
-    n = g.number_of_nodes()
-    a = np.zeros((n, n))
-    for i in range(n):
-        a[i, (i + 1) % n] = 1.0
-    for i, j in g.edges():
-        if a[i, j] or a[j, i]:
+    n = graph.number_of_nodes()
+    adjacency = np.zeros((n, n), dtype=float)
+    # A directed cycle guarantees strong connectivity, while the remaining
+    # random orientations keep the example genuinely asymmetric.
+    for node in range(n):
+        adjacency[node, (node + 1) % n] = 1.0
+    for src, dst in graph.edges():
+        if adjacency[src, dst] or adjacency[dst, src]:
             continue
         if rng.random() < 0.5:
-            a[i, j] = 1.0
+            adjacency[src, dst] = 1.0
         else:
-            a[j, i] = 1.0
-    return a
+            adjacency[dst, src] = 1.0
+    return adjacency
 
 
-def write_examples(out_dir):
-    specs = [("fig4_undirected_unweighted", False, False), ("fig5_directed_unweighted", True, False), ("fig6_undirected_weighted", False, True)]
-    for fig_idx, (folder, directed, weighted) in enumerate(specs):
-        folder_path = Path(out_dir) / folder
-        folder_path.mkdir(parents=True, exist_ok=True)
-        for net_idx, kind in enumerate(["BA", "SW", "ER"]):
-            seed = 42 + 1000 * net_idx + 10000 * fig_idx
-            g = connected_graph(kind, 40, seed)
-            a = directed_adjacency(g, seed + 123) if directed else undirected_adjacency(g, weighted, seed + 456)
-            np.savetxt(folder_path / f"{kind}.csv", a, delimiter=",", fmt="%.10g")
+def undirected_adjacency(graph: nx.Graph, weighted: bool, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    n = graph.number_of_nodes()
+    adjacency = np.zeros((n, n), dtype=float)
+    for src, dst in graph.edges():
+        weight = float(rng.uniform(0.5, 1.5)) if weighted else 1.0
+        adjacency[src, dst] = weight
+        adjacency[dst, src] = weight
+    return adjacency
 
 
-def parse_budget(text):
-    if text is None or str(text).lower() == "full":
+def random_seed() -> int:
+    return int(np.random.default_rng().integers(0, 2**32 - 1))
+
+
+def synthetic_network(args: argparse.Namespace) -> NetworkInput:
+    if args.example is None:
+        raise ValueError("--example is required for synthetic generation")
+    if args.network is None:
+        raise ValueError("--network is required when --example is used")
+    seed = args.seed if args.seed is not None else random_seed()
+    args.seed = seed
+    graph = connected_graph(
+        args.network,
+        args.n,
+        seed,
+        ba_m=args.ba_m,
+        sw_k=args.sw_k,
+        sw_p=args.sw_p,
+        er_p=args.er_p,
+    )
+    if args.example == "fig4":
+        adjacency = undirected_adjacency(graph, weighted=False, seed=seed)
+        source_format = "synthetic:fig4_undirected_unweighted"
+    elif args.example == "fig5":
+        adjacency = orient_strongly_connected(graph, seed)
+        source_format = "synthetic:fig5_directed_unweighted"
+    elif args.example == "fig6":
+        adjacency = undirected_adjacency(graph, weighted=True, seed=seed)
+        source_format = "synthetic:fig6_undirected_weighted"
+    else:
+        raise ValueError(args.example)
+    return NetworkInput(
+        adjacency=adjacency,
+        labels=[str(i) for i in range(adjacency.shape[0])],
+        directed=detect_directed(adjacency),
+        weighted=detect_weighted(adjacency),
+        source_format=source_format,
+    )
+
+
+def parse_budget(text: str) -> Optional[int]:
+    if text.lower() == "full":
         return None
     value = int(text)
     if value <= 0:
-        raise argparse.ArgumentTypeError("budget must be positive or full")
+        raise argparse.ArgumentTypeError("budget must be positive or 'full'")
     return value
 
 
-def main():
-    p = argparse.ArgumentParser(description="Run SBIA and centrality baselines on an input network.")
-    p.add_argument("--input", type=Path, help="Adjacency matrix or edge-list file")
-    p.add_argument("--format", choices=["auto", "matrix", "edgelist"], default="auto")
-    p.add_argument("--output-dir", type=Path, default=Path("sbia_output"))
-    p.add_argument("--budget", type=parse_budget, default=None, help="Number of additions, or full")
-    p.add_argument("--add-weight", type=float, default=1.0)
-    p.add_argument("--write-examples", type=Path, help="Write Fig. 4--6 example inputs and exit")
-    args = p.parse_args()
-    if args.write_examples:
-        write_examples(args.write_examples)
-        print(f"Wrote example inputs to {args.write_examples.resolve()}")
-        return
-    if args.input is None:
-        p.error("--input is required unless --write-examples is used")
-    a, labels, directed, weighted, source_format = load_network(args.input, args.format)
-    curves, aucs, edges = evaluate(a, labels, directed, args.budget, args.add_weight)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    curves.to_csv(args.output_dir / "curves.csv", index=False)
-    aucs.to_csv(args.output_dir / "auc.csv", index=False)
-    edges.to_csv(args.output_dir / "selected_edges.csv", index=False)
-    plot_summary(curves, aucs, args.output_dir / "summary.png")
-    meta = {"input": str(args.input), "source_format": source_format, "nodes": len(labels), "directed": directed, "weighted": weighted, "budget": args.budget, "add_weight": args.add_weight}
-    (args.output_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    print(f"Detected network: nodes={len(labels)}, directed={directed}, weighted={weighted}")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run SBIA and centrality baselines on an input network."
+    )
+    parser.add_argument("--input", type=Path, help="Network file: square adjacency matrix or edge list.")
+    parser.add_argument("--example", choices=["fig4", "fig5", "fig6"], help="Generate a synthetic example corresponding to Fig. 4, 5, or 6.")
+    parser.add_argument("--network", choices=["BA", "SW", "ER"], help="Synthetic network family used with --example.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for synthetic example generation. If omitted, a random seed is generated and recorded.")
+    parser.add_argument("--n", type=int, default=40, help="Number of nodes for synthetic examples.")
+    parser.add_argument("--ba-m", type=int, default=2, help="BA attachment parameter for synthetic examples.")
+    parser.add_argument("--sw-k", type=int, default=4, help="SW mean degree parameter for synthetic examples.")
+    parser.add_argument("--sw-p", type=float, default=0.15, help="SW rewiring probability for synthetic examples.")
+    parser.add_argument("--er-p", type=float, default=0.10, help="ER connection probability for synthetic examples.")
+    parser.add_argument("--format", choices=["auto", "matrix", "edgelist"], default="auto")
+    parser.add_argument("--output-dir", type=Path, default=Path("sbia_output"))
+    parser.add_argument("--budget", type=parse_budget, default=None, help="Number of added edges, or 'full'.")
+    parser.add_argument("--add-weight", type=float, default=1.0, help="Weight assigned to each added edge.")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.input is not None and args.example is not None:
+        parser.error("use either --input or --example, not both")
+    if args.input is None and args.example is None:
+        parser.error("either --input or --example is required")
+
+    if args.example is not None:
+        network = synthetic_network(args)
+    else:
+        network = load_network(args.input, args.format)
+    curves, aucs, selected_edges = evaluate_network(
+        network, budget=args.budget, add_weight=args.add_weight
+    )
+    write_outputs(args.output_dir, network, curves, aucs, selected_edges, args)
+    print(
+        "Detected network: "
+        f"nodes={len(network.labels)}, directed={network.directed}, weighted={network.weighted}"
+    )
     print(aucs.sort_values("auc", ascending=False).to_string(index=False))
     print(f"Wrote outputs to {args.output_dir.resolve()}")
 
